@@ -1,6 +1,6 @@
 # Krusch Agentic MCP
 
-![Krusch Agentic Proxy Banner](/home/kruschdev/.gemini/antigravity/brain/b07cd2e7-fffd-4c42-8b50-847d8f1d2737/krusch_agentic_mcp_banner_1776644666511.png)
+![Krusch Agentic Proxy Banner](docs/assets/banner.png)
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
