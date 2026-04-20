@@ -1,0 +1,34 @@
+# Environments
+venv/
+bench_venv/
+env/
+.env
+api/config.json
+GEMINI_INFLIGHT.md
+AGENTS.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Logs
+*.log
+*.out
+benchmark_full.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database / Docker
+# We want to keep the database directory and schema.sql, but ignore actual PG data if mapped locally
+pgdata/
+*pgdata/
+
+mcp_env/
+krusch_agentic_proxy.egg-info/
+weklund.pid
+config.json
+config_*.json
