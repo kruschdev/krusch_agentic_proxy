@@ -6,6 +6,8 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import uvicorn
+import httpx
+from fastapi.responses import StreamingResponse
 
 # Ensure src is in the python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,12 +26,139 @@ def load_config():
 config = load_config()
 krusch_engine = KruschEngine(config)
 
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+AUTO_ROUTER_MODELS = [
+    "google/gemini-2.5-flash",
+    "anthropic/claude-3.5-haiku",
+    "meta-llama/llama-3.3-70b-instruct"
+]
+
+@app.post("/v1/proxy/openrouter")
+async def openrouter_proxy(request: Request):
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return JSONResponse({"error": "OPENROUTER_API_KEY is not configured on the proxy."}, status_code=500)
+        
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        
+    if "model" in data:
+        del data["model"]
+        
+    data["models"] = AUTO_ROUTER_MODELS
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "HTTP-Referer": "http://localhost:5440",
+        "X-Title": "Krusch Agentic Auto-Router",
+        "Content-Type": "application/json"
+    }
+
+    async def stream_generator():
+        async with httpx.AsyncClient() as client:
+            try:
+                async with client.stream("POST", OPENROUTER_API_URL, json=data, headers=headers, timeout=60.0) as response:
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+            except Exception as e:
+                yield f"data: {{\"error\": \"Proxy stream failed: {str(e)}\"}}\n\n".encode("utf-8")
+
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+async def waterfall_router(data: dict, messages: list):
+    """Iterates through configured waterfall_routes until one yields a successful response/stream."""
+    routes = config.get("waterfall_routes", [])
+    if not routes:
+        return JSONResponse({"error": "No waterfall_routes configured for auto-cloud routing."}, status_code=500)
+    
+    last_error = "No routes attempted."
+    
+    for route in routes:
+        api_url = route.get("api_url")
+        route_name = route.get("name", "Unknown Route")
+        print(f"[Waterfall Router] Attempting route: {route_name} ({api_url})")
+        
+        # Prepare payload
+        payload = dict(data)
+        if "model" in payload:
+            del payload["model"]
+        
+        if "models" in route:
+            payload["models"] = route["models"]
+        elif "model" in route:
+            payload["model"] = route["model"]
+            
+        # Resolve API Key
+        raw_key = route.get("api_key", "")
+        if raw_key.startswith("ENV:"):
+            api_key = os.environ.get(raw_key[4:], "")
+        else:
+            api_key = raw_key
+            
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:5440",
+            "X-Title": "Krusch Agentic Waterfall Router"
+        }
+        
+        # If the client requested a stream, we MUST stream it back.
+        # Otherwise, we wait for the full response.
+        is_stream = data.get("stream", False)
+        
+        try:
+            if is_stream:
+                # We can't just return a StreamingResponse here if we want to catch errors, 
+                # but we can try to establish the connection first.
+                client = httpx.AsyncClient(timeout=60.0)
+                req = client.build_request("POST", api_url, json=payload, headers=headers)
+                resp = await client.send(req, stream=True)
+                
+                if resp.status_code == 200:
+                    async def stream_generator(response, c):
+                        try:
+                            async for chunk in response.aiter_bytes():
+                                yield chunk
+                        finally:
+                            await response.aclose()
+                            await c.aclose()
+                    return StreamingResponse(stream_generator(resp, client), media_type="text/event-stream")
+                else:
+                    error_body = await resp.aread()
+                    last_error = f"HTTP {resp.status_code}: {error_body.decode('utf-8', errors='ignore')}"
+                    print(f"[Waterfall Router] Route {route_name} failed: {last_error}")
+                    await resp.aclose()
+                    await client.aclose()
+            else:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(api_url, json=payload, headers=headers)
+                    if resp.status_code == 200:
+                        return JSONResponse(resp.json())
+                    else:
+                        last_error = f"HTTP {resp.status_code}: {resp.text}"
+                        print(f"[Waterfall Router] Route {route_name} failed: {last_error}")
+                        
+        except Exception as e:
+            last_error = f"Connection error: {str(e)}"
+            print(f"[Waterfall Router] Route {route_name} exception: {last_error}")
+            
+    # If all routes fail, return the last error
+    return JSONResponse({
+        "error": f"All waterfall routes failed. Last error: {last_error}"
+    }, status_code=502)
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     data = await request.json()
     messages = data.get("messages", [])
     model = data.get("model", config.get("llm", {}).get("model", "qwen2.5-coder:7b"))
     
+    if model == "auto-cloud" or os.environ.get("USE_AUTO_CLOUD") == "1":
+        print(f"[API Gateway] 'auto-cloud' detected. Intercepting request for Waterfall Auto-Routing.")
+        return await waterfall_router(data, messages)
+        
     # Extract the last user message
     user_prompt = ""
     for msg in reversed(messages):
@@ -114,6 +243,10 @@ async def chat_completions(request: Request):
             temperature=0.1
         )
         
+        combined_response = response_text
+        if blueprint:
+            combined_response = f"<holodata>\n{blueprint}\n</holodata>\n\n{response_text}"
+
         return JSONResponse({
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -123,7 +256,7 @@ async def chat_completions(request: Request):
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": response_text
+                    "content": combined_response
                 },
                 "finish_reason": "stop"
             }],

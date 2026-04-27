@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krusch-agentic-proxy"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Dual-Engine MCP Server for flawless 7B local model tool calling."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -3,6 +3,7 @@ import sys
 import json
 import subprocess
 import asyncio
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -71,6 +72,16 @@ INTERNAL_TOOLS = [
 def execute_internal_tool(tool_name, parameters):
     if tool_name == "run_bash_command":
         cmd = parameters.get("command", "")
+        if os.getenv("TAC_BRIDGE_MODE") == "1":
+            try:
+                response = httpx.post("http://127.0.0.1:11441/tac/run", json={"command": cmd}, timeout=120)
+                data = response.json()
+                if "error" in data and not data.get("output"):
+                    return f"Execution Failed:\\n{data['error']}"
+                return f"STDOUT:\\n{data.get('output', '')}\\nEXIT_CODE: {data.get('exit_code', '')}"
+            except Exception as e:
+                return f"TAC Bridge Execution Failed: {str(e)}"
+                
         try:
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
             return f"STDOUT:\\n{result.stdout}\\nSTDERR:\\n{result.stderr}"
@@ -121,10 +132,21 @@ AVAILABLE TOOLS:
             temperature=0.1
         )
         
+        # Parse the JSON tool call from the text response
+        tool_call = None
+        try:
+            tools = json.loads(response_text)
+            if isinstance(tools, list) and len(tools) > 0:
+                tool_call = tools[0]
+            elif isinstance(tools, dict):
+                tool_call = tools
+        except Exception:
+            pass
+
         # Check if the engine called a tool
-        if blueprint and "name" in blueprint:
-            tool_name = blueprint["name"]
-            tool_args = blueprint.get("parameters", {})
+        if tool_call and "name" in tool_call:
+            tool_name = tool_call["name"]
+            tool_args = tool_call.get("arguments", {})
             
             print(f"[*] Calling Tool: {tool_name}")
             

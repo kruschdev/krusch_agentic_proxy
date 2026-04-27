@@ -19,6 +19,14 @@ Krusch Agentic MCP solves this by exposing a single MCP Tool (`krusch_execute_ta
 3. **Optimized Latency**: Uses **Unified Execution** mode to autoregressively stream the blueprint and the final implementation in a single pass, cutting cognitive latency in half.
 4. **Standalone Architecture**: 100% decoupled from specific business logic or homelab dependencies, designed explicitly as a generalized execution node for the open-source community.
 
+### 🌊 Multi-Provider Waterfall Auto-Routing (v0.2.0+)
+
+Krusch Agentic MCP now features a resilient **Waterfall Auto-Routing** proxy. You can configure multiple LLM providers to ensure task continuity if your primary model fails.
+
+- **Primary Local/VPS Models:** Route tasks to a private VPS-hosted model (like Nous Hermes) via secure API keys.
+- **Cost-Effective Fallbacks:** If the primary node is unreachable or encounters an error, the proxy automatically falls back to secondary routes like OpenRouter (e.g. Gemini Flash, Llama 3).
+- **Environment Variable Secrets:** Safely pass API keys via `ENV:MY_API_KEY` configurations instead of hardcoding them.
+
 ### 🔄 Dual Integration Modes (MCP vs API Proxy)
 
 Is it an MCP or a Proxy? **It is both.** 
