@@ -81,6 +81,19 @@ The Krusch Agentic Proxy acts as a structural safety net. By forcing the model t
 > [!WARNING]
 > **The Small-Model Cognitive Penalty:** The Dual-Engine Proxy is a massive multiplier for capable 7B-14B models. However, **it penalizes small models (≤ 3B).** The cognitive load of formatting the massive `<holodata>` JSON "Thinker" blueprint actually distracts the smaller models. They become so hyper-focused on escaping JSON brackets correctly that their core reasoning degrades. **Do not route 3B or sub-3B models through the proxy.**
 
+## 🤝 The DBOS Agentic Ecosystem
+
+This project is a dedicated node within the **Krusch DBOS Agentic Ecosystem**. The architecture moves away from monolithic local applications into a highly modular, distributed swarm of specialized Model Context Protocol (MCP) servers.
+
+- **[Krusch DBOS MCP](https://github.com/kruschdev/krusch-dbos-mcp)**: The central Orchestrator and Postgres-backed state machine.
+- **[Krusch Agentic Proxy](https://github.com/kruschdev/krusch-agentic-mcp)**: The Intelligence Layer (LLM Waterfall Router).
+- **[PG-Git MCP](https://github.com/kruschdev/pg-git)**: Source Control Boundary (Code Editing & Commits).
+- **[Krusch Infra MCP](https://github.com/kruschdev/krusch-infra-mcp)**: System Ops Boundary (Docker & SRE).
+- **[Signet MCP](https://github.com/kruschdev/signet)**: Communications Boundary (Email & Calendar).
+- **[Krusch Memory MCP](https://github.com/kruschdev/krusch-memory-mcp)**: Episodic History Boundary (Project-isolated Temporal Memory).
+
+> 🗺️ **Want to see the big picture?** Read the [Ecosystem Blueprint](https://github.com/kruschdev/krusch-dbos-mcp/blob/main/ECOSYSTEM.md) for a complete diagram of how these boundaries fit together.
+
 ---
 
 ## 🚀 Quick Start Guide
