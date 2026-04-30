@@ -108,7 +108,7 @@ Edit `config.json` to point to your local LLM API endpoint.
 
 ### 4. Integration
 
-Add the Krusch Agentic MCP to your `mcp_client_config.json` (for OpenClaw, Claude Desktop, or Cursor):
+**For OpenClaw, Claude Desktop, or Cursor**, add the Krusch Agentic MCP to your `mcp_client_config.json`:
 
 ```json
 {
@@ -119,6 +119,15 @@ Add the Krusch Agentic MCP to your `mcp_client_config.json` (for OpenClaw, Claud
     }
   }
 }
+```
+
+**For Hermes Agent**, add the following to your `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  krusch_engine:
+    command: "krusch-agentic-mcp"
+    args: []
 ```
 
 ## 🛠️ Exposed Tools
