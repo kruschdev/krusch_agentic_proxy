@@ -18,7 +18,7 @@ echo ""
 # Ensure API is running
 if ! curl -s http://localhost:5440/health > /dev/null; then
     echo "[!] Error: The Krusch Agentic Proxy API is not running on localhost:5440."
-    echo "    Please start the API first: cd api && python app/api_gateway.py"
+    echo "    Please start the API first: python src/api_gateway.py"
     exit 1
 fi
 

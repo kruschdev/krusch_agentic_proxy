@@ -1,281 +1,208 @@
+"""
+Krusch Agentic Proxy — OpenAI-Compatible API Gateway.
+
+Serves as a FastAPI REST endpoint on port 5440, routing requests through
+the Dual-Engine pipeline, waterfall cloud routing, or fast-path NLP.
+"""
+
 import os
 import sys
 import json
 import uuid
 import time
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import uvicorn
-import httpx
-from fastapi.responses import StreamingResponse
 
 # Ensure src is in the python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.core import KruschEngine
+from src.router import WaterfallRouter
+from src.tools import INTERNAL_TOOLS, execute_internal_tool
+from src.models import ChatCompletionRequest
 
-app = FastAPI(title="Krusch Agentic Proxy (OpenAI API)")
+logger = logging.getLogger(__name__)
 
+# Max wall-clock time for the autonomous agent loop (seconds)
+AGENT_TIMEOUT = float(os.environ.get("KRUSCH_AGENT_TIMEOUT", "120"))
+
+
+# --- Configuration ---
 def load_config():
     try:
-        config_path = os.environ.get("KRUSCH_PROXY_CONFIG", os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.json'))
+        config_path = os.environ.get(
+            "KRUSCH_PROXY_CONFIG",
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.json')
+        )
         with open(config_path, 'r') as f:
             return json.load(f)
     except Exception:
         return {"llm": {"model": "qwen2.5-coder:7b", "api_url": "http://127.0.0.1:11434/v1/chat/completions"}}
 
-config = load_config()
-krusch_engine = KruschEngine(config)
 
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-AUTO_ROUTER_MODELS = [
-    "google/gemini-2.5-flash",
-    "anthropic/claude-3.5-haiku",
-    "meta-llama/llama-3.3-70b-instruct"
-]
+# --- Application Lifecycle ---
+# Engine and router are initialized at startup, not import time (H2)
+_engine: KruschEngine = None
+_router: WaterfallRouter = None
+_config: dict = None
 
-@app.post("/v1/proxy/openrouter")
-async def openrouter_proxy(request: Request):
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        return JSONResponse({"error": "OPENROUTER_API_KEY is not configured on the proxy."}, status_code=500)
-        
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        
-    if "model" in data:
-        del data["model"]
-        
-    data["models"] = AUTO_ROUTER_MODELS
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "HTTP-Referer": "http://localhost:5440",
-        "X-Title": "Krusch Agentic Auto-Router",
-        "Content-Type": "application/json"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize engine and router on startup, clean up on shutdown."""
+    global _engine, _router, _config
+    _config = load_config()
+    _engine = KruschEngine(_config)
+    _router = WaterfallRouter(_config.get("waterfall_routes", []))
+    logger.info("[Gateway] Engine and WaterfallRouter initialized.")
+    yield
+    logger.info("[Gateway] Shutting down.")
+
+
+app = FastAPI(title="Krusch Agentic Proxy (OpenAI API)", lifespan=lifespan)
+
+
+# --- Helper ---
+def _build_response(model: str, content: str, finish_reason: str = "stop",
+                    tool_calls=None) -> dict:
+    """Build a standard OpenAI-compatible response dict."""
+    msg = {"role": "assistant", "content": content}
+    if tool_calls:
+        msg["content"] = None
+        msg["tool_calls"] = tool_calls
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
+        # Token counts omitted — accurate counting requires a tokenizer (M1)
     }
 
-    async def stream_generator():
-        async with httpx.AsyncClient() as client:
-            try:
-                async with client.stream("POST", OPENROUTER_API_URL, json=data, headers=headers, timeout=60.0) as response:
-                    async for chunk in response.aiter_bytes():
-                        yield chunk
-            except Exception as e:
-                yield f"data: {{\"error\": \"Proxy stream failed: {str(e)}\"}}\n\n".encode("utf-8")
 
-    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+# --- Endpoints ---
 
-async def waterfall_router(data: dict, messages: list):
-    """Iterates through configured waterfall_routes until one yields a successful response/stream."""
-    routes = config.get("waterfall_routes", [])
-    if not routes:
-        return JSONResponse({"error": "No waterfall_routes configured for auto-cloud routing."}, status_code=500)
-    
-    last_error = "No routes attempted."
-    
-    for route in routes:
-        api_url = route.get("api_url")
-        route_name = route.get("name", "Unknown Route")
-        print(f"[Waterfall Router] Attempting route: {route_name} ({api_url})")
-        
-        # Prepare payload
-        payload = dict(data)
-        if "model" in payload:
-            del payload["model"]
-        
-        if "models" in route:
-            payload["models"] = route["models"]
-        elif "model" in route:
-            payload["model"] = route["model"]
-            
-        # Resolve API Key
-        raw_key = route.get("api_key", "")
-        if raw_key.startswith("ENV:"):
-            api_key = os.environ.get(raw_key[4:], "")
-        else:
-            api_key = raw_key
-            
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:5440",
-            "X-Title": "Krusch Agentic Waterfall Router"
-        }
-        
-        # If the client requested a stream, we MUST stream it back.
-        # Otherwise, we wait for the full response.
-        is_stream = data.get("stream", False)
-        
-        try:
-            if is_stream:
-                # We can't just return a StreamingResponse here if we want to catch errors, 
-                # but we can try to establish the connection first.
-                client = httpx.AsyncClient(timeout=60.0)
-                req = client.build_request("POST", api_url, json=payload, headers=headers)
-                resp = await client.send(req, stream=True)
-                
-                if resp.status_code == 200:
-                    async def stream_generator(response, c):
-                        try:
-                            async for chunk in response.aiter_bytes():
-                                yield chunk
-                        finally:
-                            await response.aclose()
-                            await c.aclose()
-                    return StreamingResponse(stream_generator(resp, client), media_type="text/event-stream")
-                else:
-                    error_body = await resp.aread()
-                    last_error = f"HTTP {resp.status_code}: {error_body.decode('utf-8', errors='ignore')}"
-                    print(f"[Waterfall Router] Route {route_name} failed: {last_error}")
-                    await resp.aclose()
-                    await client.aclose()
-            else:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    resp = await client.post(api_url, json=payload, headers=headers)
-                    if resp.status_code == 200:
-                        return JSONResponse(resp.json())
-                    else:
-                        last_error = f"HTTP {resp.status_code}: {resp.text}"
-                        print(f"[Waterfall Router] Route {route_name} failed: {last_error}")
-                        
-        except Exception as e:
-            last_error = f"Connection error: {str(e)}"
-            print(f"[Waterfall Router] Route {route_name} exception: {last_error}")
-            
-    # If all routes fail, return the last error
-    return JSONResponse({
-        "error": f"All waterfall routes failed. Last error: {last_error}"
-    }, status_code=502)
+@app.get("/health")
+async def health():
+    """Health check endpoint for monitoring and benchmark scripts."""
+    return {"status": "ok", "engine": "krusch-agentic-proxy"}
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    data = await request.json()
-    messages = data.get("messages", [])
-    model = data.get("model", config.get("llm", {}).get("model", "qwen2.5-coder:7b"))
-    
+    # Validate request body via Pydantic (C4)
+    try:
+        raw_data = await request.json()
+        validated = ChatCompletionRequest(**raw_data)
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid request: {str(e)}"}, status_code=400)
+
+    data = raw_data  # Keep raw dict for waterfall passthrough
+    messages = [msg.model_dump(exclude_none=True) for msg in validated.messages]
+    model = validated.model or _config.get("llm", {}).get("model", "qwen2.5-coder:7b")
+
+    # --- WATERFALL AUTO-CLOUD ROUTING ---
     if model == "auto-cloud" or os.environ.get("USE_AUTO_CLOUD") == "1":
-        print(f"[API Gateway] 'auto-cloud' detected. Intercepting request for Waterfall Auto-Routing.")
-        return await waterfall_router(data, messages)
-        
+        logger.info("[Gateway] 'auto-cloud' detected. Intercepting for Waterfall Auto-Routing.")
+        is_stream = validated.stream or False
+        return await _router.route_proxy(data, is_stream=is_stream)
+
     # Extract the last user message
     user_prompt = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
             user_prompt = msg.get("content", "")
             break
-            
+
     if not user_prompt:
         user_prompt = "No user prompt provided."
 
-    print(f"[API Gateway] Received request for model {model}. Prompt length: {len(user_prompt)}")
+    logger.info(f"[Gateway] Request for model {model}. Prompt length: {len(user_prompt)}")
 
-    provided_tools = data.get("tools", [])
+    provided_tools = validated.tools or []
     is_passive_mode = os.environ.get("PASSIVE_MODE") == "1"
-    force_autonomous = data.get("force_autonomous", False)
+    force_autonomous = validated.force_autonomous or False
     force_dual_engine = os.environ.get("FORCE_DUAL_ENGINE") == "1"
-    
+
     # --- SMART ROUTING GATE ---
-    # The Dual-Engine pipeline acts as a structural multiplier for capable models (>=7B).
-    # However, it imposes a severe "Cognitive Penalty" on small models (<=3B), degrading 
-    # their baseline logic as they hyper-focus on escaping JSON constraints.
     model_lower = model.lower()
     is_small_model = any(tag in model_lower for tag in ["0.5b", "1.5b", "2b", "3b"])
-    
+
     if is_small_model and (provided_tools or force_dual_engine) and not is_passive_mode:
-        print(f"⚠️ [ROUTING GATE WARNING]: {model} detected as a Small Model (<= 3B parameters).")
-        print(f"⚠️ The Dual-Engine JSON constraint will likely degrade its performance due to the Cognitive Penalty.")
-        print(f"⚠️ It is highly recommended to route this model to a standard NLP pipeline instead.")
-    
-    # Router: Fast-Path for Standard NLP
-    # If no tools are provided and we aren't forcing the autonomous loop or dual engine, just answer normally.
+        logger.warning(
+            f"⚠️ [ROUTING GATE]: {model} detected as Small Model (≤ 3B). "
+            f"Dual-Engine will likely degrade performance due to Cognitive Penalty."
+        )
+
+    # --- FAST-PATH: Standard NLP ---
     if not provided_tools and not is_passive_mode and not force_autonomous and not force_dual_engine:
-        print(f"[API Gateway] Fast-path routing: Standard NLP request detected.")
-        
-        # Build full conversation context for normal chat
+        logger.info("[Gateway] Fast-path routing: Standard NLP request.")
+
         chat_context = ""
         for msg in messages:
             role = msg.get("role", "user").upper()
             content = msg.get("content", "")
             chat_context += f"{role}: {content}\n"
-            
-        _, response_text = await krusch_engine.generate(
+
+        _, response_text = await _engine.generate(
             prompt=chat_context,
             is_code_exec=False,
             is_tool_call=False,
             target_model=model,
-            max_tokens=2048,
+            max_tokens=validated.max_tokens or 2048,
             temperature=0.6
         )
-        
-        return JSONResponse({
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": response_text
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": len(chat_context)//4, "completion_tokens": len(response_text)//4, "total_tokens": (len(chat_context)+len(response_text))//4}
-        })
 
-    # Router: Standard NLP via Dual-Engine (For Benchmarking)
+        return JSONResponse(_build_response(model, response_text))
+
+    # --- FORCED DUAL-ENGINE NLP (Benchmarking) ---
     if force_dual_engine and not provided_tools:
-        print(f"[API Gateway] Forced Dual-Engine NLP routing active.")
+        logger.info("[Gateway] Forced Dual-Engine NLP routing active.")
         chat_context = ""
         for msg in messages:
             role = msg.get("role", "user").upper()
             content = msg.get("content", "")
             chat_context += f"{role}: {content}\n"
-            
-        blueprint, response_text = await krusch_engine.generate(
+
+        blueprint, response_text = await _engine.generate(
             prompt=chat_context,
             is_code_exec=False,
             is_tool_call=False,
             target_model=model,
-            max_tokens=2048,
+            max_tokens=validated.max_tokens or 2048,
             temperature=0.1
         )
-        
-        combined_response = response_text
-        if blueprint:
-            combined_response = f"<holodata>\n{blueprint}\n</holodata>\n\n{response_text}"
 
-        return JSONResponse({
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": combined_response
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": len(chat_context)//4, "completion_tokens": len(response_text)//4, "total_tokens": (len(chat_context)+len(response_text))//4}
-        })
-    
+        combined = response_text
+        if blueprint:
+            combined = f"<holodata>\n{blueprint}\n</holodata>\n\n{response_text}"
+
+        return JSONResponse(_build_response(model, combined))
+
+    # --- TOOL-CALLING MODE ---
     if provided_tools or is_passive_mode:
-        print(f"[API Gateway] Tool-calling Mode Active. Using Dual-Engine pipeline.")
-        chat_history = f"OBJECTIVE: {user_prompt}\nAVAILABLE TOOLS:\n{json.dumps(provided_tools, indent=2)}\n" if provided_tools else f"OBJECTIVE: {user_prompt}\n"
-        blueprint, response_text = await krusch_engine.generate(
+        logger.info("[Gateway] Tool-calling Mode Active. Using Dual-Engine pipeline.")
+        chat_history = (
+            f"OBJECTIVE: {user_prompt}\nAVAILABLE TOOLS:\n{json.dumps(provided_tools, indent=2)}\n"
+            if provided_tools
+            else f"OBJECTIVE: {user_prompt}\n"
+        )
+
+        blueprint, response_text = await _engine.generate(
             prompt=chat_history,
             is_code_exec=False,
             is_tool_call=True,
             exact_signature="",
             target_model=model,
-            max_tokens=2048,
+            max_tokens=validated.max_tokens or 2048,
             temperature=0.1
         )
-        
+
+        # Parse tool calls from response
         tool_calls = []
         try:
             parsed = json.loads(response_text)
@@ -283,9 +210,9 @@ async def chat_completions(request: Request):
                 tool_calls = parsed
             elif isinstance(parsed, dict) and "name" in parsed:
                 tool_calls = [parsed]
-        except Exception:
-            pass
-            
+        except json.JSONDecodeError:
+            logger.warning(f"[Gateway] Failed to parse tool-call JSON: {response_text[:200]}")
+
         openai_tool_calls = []
         for tc in tool_calls:
             if isinstance(tc, dict) and "name" in tc:
@@ -297,123 +224,76 @@ async def chat_completions(request: Request):
                         "arguments": json.dumps(tc.get("arguments", tc.get("parameters", {})))
                     }
                 })
-        
-        # If the benchmark expects a raw JSON string in the text response (Weklund style)
-        # We should just return the raw response_text if openai_tool_calls is empty or not requested via 'tools'
+
         if not provided_tools:
-            msg_obj = {
-                "role": "assistant",
-                "content": response_text
-            }
-        else:
-            msg_obj = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": openai_tool_calls
-            } if openai_tool_calls else {
-                "role": "assistant",
-                "content": response_text
-            }
-        
-        return JSONResponse({
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": msg_obj,
-                "finish_reason": "tool_calls" if openai_tool_calls else "stop"
-            }],
-            "usage": {"prompt_tokens": len(user_prompt)//4, "completion_tokens": len(response_text)//4, "total_tokens": (len(user_prompt)+len(response_text))//4}
-        })
+            return JSONResponse(_build_response(model, response_text))
 
-    # Execute through Dual-Engine Thinker (Autonomous Loop)
-    # We treat standard API calls as tool_call=False for the initial pass, 
-    # but the engine handles the autonomous loop internally if we wrap it properly,
-    # or we can manually run the autonomous loop here like we did in mcp_server.py
-    
-    max_loops = 5
-    chat_history = f"You are the Krusch Autonomous Proxy. Achieve the objective.\\nOBJECTIVE: {user_prompt}\\n"
-    
-    from src.mcp_server import execute_internal_tool
-    
-    final_answer = "Error: Agent exceeded max iterations."
-    
-    for iteration in range(max_loops):
-        print(f"  -> Iteration {iteration+1}...")
-        blueprint, response_text = await krusch_engine.generate(
-            prompt=chat_history,
-            is_code_exec=False,
-            is_tool_call=True,
-            exact_signature="",
-            target_model=model,
-            max_tokens=2048,
-            temperature=0.1
-        )
-        
-        # The tools are returned in response_text as a JSON array when is_tool_call=True
-        tool_calls = []
-        try:
-            # Attempt to parse response_text as JSON
-            parsed = json.loads(response_text)
-            if isinstance(parsed, list):
-                tool_calls = parsed
-            elif isinstance(parsed, dict) and "name" in parsed:
-                tool_calls = [parsed]
-        except json.JSONDecodeError:
-            pass
-
-        if tool_calls:
-            for tool in tool_calls:
-                if not isinstance(tool, dict):
-                    chat_history += "\\nSYSTEM: Invalid tool call format. Expected a JSON object, got: " + str(type(tool)) + ". Please output a list of valid tool call objects."
-                    break
-                    
-                tool_name = tool.get("name")
-                tool_args = tool.get("arguments", tool.get("parameters", {}))
-                
-                if tool_name == "final_answer":
-                    final_answer = tool_args.get("answer", "Objective complete.")
-                    break
-                    
-                tool_result = execute_internal_tool(tool_name, tool_args)
-                chat_history += f"\\nASSISTANT CALLED TOOL: {tool_name}\\nWITH ARGS: {json.dumps(tool_args)}\\nRESULT:\\n{tool_result}\\n"
-                
-            if final_answer != "Error: Agent exceeded max iterations.":
-                break
+        if openai_tool_calls:
+            return JSONResponse(_build_response(model, None, finish_reason="tool_calls",
+                                                tool_calls=openai_tool_calls))
         else:
-            if response_text and "final_answer" not in response_text:
-                final_answer = response_text
-                break
+            return JSONResponse(_build_response(model, response_text))
+
+    # --- AUTONOMOUS AGENT LOOP ---
+    async def _autonomous_loop():
+        chat_history = f"You are the Krusch Autonomous Proxy. Achieve the objective.\nOBJECTIVE: {user_prompt}\n"
+        max_loops = 5
+        final_answer = "Error: Agent exceeded max iterations."
+
+        for iteration in range(max_loops):
+            logger.info(f"  -> Iteration {iteration+1}...")
+            blueprint, response_text = await _engine.generate(
+                prompt=chat_history,
+                is_code_exec=False,
+                is_tool_call=True,
+                exact_signature="",
+                target_model=model,
+                max_tokens=2048,
+                temperature=0.1
+            )
+
+            tool_calls = []
+            try:
+                parsed = json.loads(response_text)
+                if isinstance(parsed, list):
+                    tool_calls = parsed
+                elif isinstance(parsed, dict) and "name" in parsed:
+                    tool_calls = [parsed]
+            except json.JSONDecodeError:
+                logger.warning(f"[Gateway] Autonomous loop parse failure: {response_text[:200]}")
+
+            if tool_calls:
+                for tool in tool_calls:
+                    if not isinstance(tool, dict):
+                        chat_history += f"\nSYSTEM: Invalid tool call format. Expected JSON object, got: {type(tool)}\n"
+                        break
+
+                    tool_name = tool.get("name")
+                    tool_args = tool.get("arguments", tool.get("parameters", {}))
+
+                    if tool_name == "final_answer":
+                        return tool_args.get("answer", "Objective complete.")
+
+                    tool_result = execute_internal_tool(tool_name, tool_args)
+                    chat_history += f"\nASSISTANT CALLED TOOL: {tool_name}\nWITH ARGS: {json.dumps(tool_args)}\nRESULT:\n{tool_result}\n"
+
+                if final_answer != "Error: Agent exceeded max iterations.":
+                    break
             else:
-                chat_history += "\\nSYSTEM: You must output a valid JSON array of tool calls."
+                if response_text and "final_answer" not in response_text:
+                    return response_text
+                else:
+                    chat_history += "\nSYSTEM: You must output a valid JSON array of tool calls.\n"
 
-    # Package as OpenAI JSON
-    response_id = f"chatcmpl-{uuid.uuid4().hex}"
-    created = int(time.time())
-    
-    return JSONResponse({
-        "id": response_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": final_answer
-                },
-                "finish_reason": "stop"
-            }
-        ],
-        "usage": {
-            "prompt_tokens": len(user_prompt) // 4,
-            "completion_tokens": len(final_answer) // 4,
-            "total_tokens": (len(user_prompt) + len(final_answer)) // 4
-        }
-    })
+        return final_answer
+
+    try:
+        final_answer = await asyncio.wait_for(_autonomous_loop(), timeout=AGENT_TIMEOUT)
+    except asyncio.TimeoutError:
+        final_answer = f"Error: Autonomous agent timed out after {AGENT_TIMEOUT}s."
+
+    return JSONResponse(_build_response(model, final_answer))
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5440))

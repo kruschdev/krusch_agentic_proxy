@@ -10,7 +10,7 @@ graph TD
     OC -->|Standard Chat| OpenAI[OpenAI / Main LLM]
     MCP -->|Internal Objective Loop| Thinker[Thinker Engine]
     Thinker -->|Bash/Python Execution| Tools[Host Tools]
-    Thinker -->|Proxy Route| LocalLLM[TabbyAPI :8500]
+    Thinker -->|Proxy Route| LocalLLM[Local LLM :5000/:11434]
 ```
 
 ## Setup for OpenClaw / Cursor / Claude Desktop

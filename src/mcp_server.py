@@ -1,18 +1,28 @@
+"""
+Krusch Agentic Proxy — MCP Server (stdio transport).
+
+Exposes the `krusch_execute_task` tool via the Model Context Protocol.
+Designed for integration with MCP clients like Cursor, OpenClaw, and Claude Desktop.
+"""
+
 import os
 import sys
 import json
-import subprocess
 import asyncio
-import httpx
+import logging
+
 from mcp.server.fastmcp import FastMCP
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.core import KruschEngine
+from src.tools import INTERNAL_TOOLS, execute_internal_tool
+
+logger = logging.getLogger(__name__)
 
 # Initialize the MCP Server
 mcp = FastMCP("KruschAgenticMCP", dependencies=["httpx", "pydantic"])
 
-# Load Krusch Configuration
+
 def load_config():
     try:
         with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.json'), 'r') as f:
@@ -20,88 +30,20 @@ def load_config():
     except Exception:
         return {"llm": {"model": "qwen2.5-coder:7b", "api_url": "http://127.0.0.1:11434/v1/chat/completions"}}
 
+
 config = load_config()
 krusch_engine = KruschEngine(config)
 
-# Internal tools for the Krusch Agent to use during its autonomous loop
-INTERNAL_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "run_bash_command",
-            "description": "Executes a shell command on the host homelab and returns the stdout/stderr.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The bash command to run"}
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Reads the contents of a file on the local filesystem.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute path to the file"}
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "final_answer",
-            "description": "Call this tool to return the final answer to the user once the objective is complete.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "answer": {"type": "string", "description": "The final detailed answer to the user's objective"}
-                },
-                "required": ["answer"]
-            }
-        }
-    }
-]
+# Max wall-clock time for the autonomous loop (seconds)
+AGENT_TIMEOUT = float(os.environ.get("KRUSCH_AGENT_TIMEOUT", "120"))
 
-def execute_internal_tool(tool_name, parameters):
-    if tool_name == "run_bash_command":
-        cmd = parameters.get("command", "")
-        if os.getenv("TAC_BRIDGE_MODE") == "1":
-            try:
-                response = httpx.post("http://127.0.0.1:11441/tac/run", json={"command": cmd}, timeout=120)
-                data = response.json()
-                if "error" in data and not data.get("output"):
-                    return f"Execution Failed:\\n{data['error']}"
-                return f"STDOUT:\\n{data.get('output', '')}\\nEXIT_CODE: {data.get('exit_code', '')}"
-            except Exception as e:
-                return f"TAC Bridge Execution Failed: {str(e)}"
-                
-        try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-            return f"STDOUT:\\n{result.stdout}\\nSTDERR:\\n{result.stderr}"
-        except Exception as e:
-            return f"Execution Failed: {str(e)}"
-    elif tool_name == "read_file":
-        path = parameters.get("path", "")
-        try:
-            with open(path, "r") as f:
-                return f.read()
-        except Exception as e:
-            return f"Failed to read file: {str(e)}"
-    return f"Unknown tool: {tool_name}"
 
 @mcp.tool()
-async def spawn_autonomous_clone(objective: str) -> str:
+async def krusch_execute_task(objective: str) -> str:
     """
-    Spawns an autonomous sub-agent powered by the Krusch Dual-Engine.
-    Use this to delegate complex, multi-step coding or bash tasks that require deep reasoning.
-    The clone will work independently and return the final summary when complete.
+    Delegates a complex, multi-step objective to the Krusch Dual-Engine reasoning model.
+    The sub-agent will autonomously execute shell commands and read files to satisfy
+    the objective before returning a final answer.
     """
     system_prompt = f"""You are the Krusch Autonomous Sub-Agent. 
 You have been delegated a complex objective by a frontend agent (like OpenClaw or Hermes).
@@ -112,60 +54,66 @@ OBJECTIVE: {objective}
 AVAILABLE TOOLS:
 {json.dumps(INTERNAL_TOOLS, indent=2)}
 """
-    
+
     chat_history = system_prompt
     max_loops = 10
-    
-    for iteration in range(max_loops):
-        print(f"\\n--- Krusch Iteration {iteration+1} ---")
-        
-        target_model = config.get("llm", {}).get("model", "qwen2.5-coder:7b")
-        
-        # We pass the prompt to the dual-engine Thinker
-        blueprint, response_text = await krusch_engine.generate(
-            prompt=chat_history,
-            is_code_exec=False,
-            is_tool_call=True,
-            exact_signature="",
-            target_model=target_model,
-            max_tokens=2048,
-            temperature=0.1
-        )
-        
-        # Parse the JSON tool call from the text response
-        tool_call = None
-        try:
-            tools = json.loads(response_text)
-            if isinstance(tools, list) and len(tools) > 0:
-                tool_call = tools[0]
-            elif isinstance(tools, dict):
-                tool_call = tools
-        except Exception:
-            pass
 
-        # Check if the engine called a tool
-        if tool_call and "name" in tool_call:
-            tool_name = tool_call["name"]
-            tool_args = tool_call.get("arguments", {})
-            
-            print(f"[*] Calling Tool: {tool_name}")
-            
-            if tool_name == "final_answer":
-                return tool_args.get("answer", "Objective complete.")
-                
-            tool_result = execute_internal_tool(tool_name, tool_args)
-            print(f"[*] Tool Result: {tool_result[:100]}...")
-            
-            # Append the result to the chat history for the next iteration
-            chat_history += f"\\n\\nASSISTANT CALLED TOOL: {tool_name}\\nWITH ARGS: {json.dumps(tool_args)}\\nTOOL RESULT:\\n{tool_result}\\n"
-        else:
-            # If no tool was called but we have a text response, maybe the agent is confused.
-            chat_history += f"\\n\\nASSISTANT RESPONSE: {response_text}\\nSYSTEM: You must call a tool. Use 'final_answer' to finish."
-            
-    return "Error: Krusch Agent exceeded maximum iterations without calling final_answer."
+    async def _run_loop():
+        nonlocal chat_history
+        for iteration in range(max_loops):
+            logger.info(f"--- Krusch Iteration {iteration+1} ---")
+
+            target_model = config.get("llm", {}).get("model", "qwen2.5-coder:7b")
+
+            blueprint, response_text = await krusch_engine.generate(
+                prompt=chat_history,
+                is_code_exec=False,
+                is_tool_call=True,
+                exact_signature="",
+                target_model=target_model,
+                max_tokens=2048,
+                temperature=0.1
+            )
+
+            # Parse tool calls from response
+            tool_call = None
+            try:
+                tools = json.loads(response_text)
+                if isinstance(tools, list) and len(tools) > 0:
+                    tool_call = tools[0]
+                elif isinstance(tools, dict):
+                    tool_call = tools
+            except json.JSONDecodeError:
+                logger.warning(f"[MCP] Failed to parse tool call JSON: {response_text[:200]}")
+
+            if tool_call and "name" in tool_call:
+                tool_name = tool_call["name"]
+                tool_args = tool_call.get("arguments", {})
+
+                logger.info(f"[*] Calling Tool: {tool_name}")
+
+                if tool_name == "final_answer":
+                    return tool_args.get("answer", "Objective complete.")
+
+                tool_result = execute_internal_tool(tool_name, tool_args)
+                logger.info(f"[*] Tool Result: {tool_result[:100]}...")
+
+                chat_history += f"\n\nASSISTANT CALLED TOOL: {tool_name}\nWITH ARGS: {json.dumps(tool_args)}\nTOOL RESULT:\n{tool_result}\n"
+            else:
+                chat_history += f"\n\nASSISTANT RESPONSE: {response_text}\nSYSTEM: You must call a tool. Use 'final_answer' to finish."
+
+        return "Error: Krusch Agent exceeded maximum iterations without calling final_answer."
+
+    # Wrap the loop in a wall-clock timeout
+    try:
+        return await asyncio.wait_for(_run_loop(), timeout=AGENT_TIMEOUT)
+    except asyncio.TimeoutError:
+        return f"Error: Krusch Agent timed out after {AGENT_TIMEOUT}s."
+
 
 def main():
     mcp.run()
+
 
 if __name__ == "__main__":
     main()
