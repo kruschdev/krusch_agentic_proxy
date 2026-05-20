@@ -5,6 +5,82 @@ from typing import Tuple, Dict, Any, Optional
 
 from src.client import chat
 
+def retrieve_homelab_context(query: str, project: str = "krusch-agentic-proxy") -> str:
+    """
+    Zero-Trust database memory retriever.
+    Queries global Postgres kruschdb for lessons and nuggets.
+    """
+    import psycopg2
+    context_parts = []
+    try:
+        conn = psycopg2.connect("postgresql://openclaw:openclaw_password@10.0.0.85:5434/kruschdb", connect_timeout=3)
+        cur = conn.cursor()
+        
+        # Query nuggets
+        cur.execute("""
+            SELECT key, value FROM ide_agent_nuggets
+            WHERE (project = %s OR project IS NULL)
+            AND (key ILIKE %s OR value ILIKE %s)
+            ORDER BY updated_at DESC LIMIT 5
+        """, (project, f"%{query}%", f"%{query}%"))
+        nuggets = cur.fetchall()
+        if nuggets:
+            context_parts.append("=== 💎 Homelab Holographic Nuggets ===")
+            for key, val in nuggets:
+                context_parts.append(f"- [{key}]: {val}")
+        
+        # Query v2 lessons
+        cur.execute("""
+            SELECT category, content, ontology_tags FROM homelab_memory_v2
+            WHERE status = 'active'
+            AND (project = %s OR %s = ANY(ontology_tags) OR category = 'lessons')
+            AND (content ILIKE %s OR %s = ANY(ontology_tags))
+            ORDER BY created_at DESC LIMIT 5
+        """, (project, project, f"%{query}%", query))
+        memories = cur.fetchall()
+        if memories:
+            context_parts.append("\n=== 📖 Deep Episodic Lessons & Decisions ===")
+            for cat, content, tags in memories:
+                tags_str = f" [Tags: {', '.join(tags)}]" if tags else ""
+                context_parts.append(f"- [{cat.upper()}]{tags_str}: {content}")
+                
+        cur.close()
+        conn.close()
+    except Exception as e:
+        # Gracefully degrade if Postgres is unreachable
+        print(f"[Krusch RAG] Warning: Direct memory retrieval skipped: {e}", file=sys.stderr)
+        
+    return "\n".join(context_parts) if context_parts else ""
+
+
+def get_ollama_url_for_model(model: str, base_url: str) -> str:
+    """
+    Dynamically routes a model to the correct fleet node based on hardware capabilities.
+    Pins heavy reasoning/MoE models to dual RTX 3060 (kruschdev) and offloads smaller
+    executors/ideators to RTX 2080 Ti (kruschserv). Fallback is local kruschdev.
+    """
+    model_lower = model.lower()
+    kruschdev_only_keywords = ["30b", "31b", "32b", "deepseek-r1:14b", "r1:14b", "gemma4"]
+    if any(kw in model_lower for kw in kruschdev_only_keywords):
+        return base_url
+    
+    kruschserv_models = {
+        "qwen2.5-coder:7b", "qwen2.5-coder:14b", "hermes3:8b", "llama3.2:latest", 
+        "qwen2.5-coder:1.5b", "qwen2.5-coder:3b", "llama3.1:8b", "qwen2.5:3b",
+        "qwen3.5:9b"
+    }
+    
+    normalized = model_lower
+    if normalized.endswith(":latest"):
+        normalized = normalized[:-7]
+        
+    for km in kruschserv_models:
+        if normalized in km or km in normalized:
+            return "http://10.0.0.85:11434/v1/chat/completions"
+            
+    return base_url
+
+
 class KruschEngine:
     """
     Standalone implementation of the Dual-Engine Krusch Cognitive Architecture.
@@ -15,7 +91,7 @@ class KruschEngine:
         llm_conf = self.config.get('llm', {})
         self.default_model = llm_conf.get('model', 'qwen2.5-coder:7b')
         self.base_url = llm_conf.get('api_url', 'http://127.0.0.1:11434/v1/chat/completions')
-        self.unified_execution = True # Optimized: Merges Thinker/Implementer into a single autoregressive pass
+        self.unified_execution = False # Split cognitive load: 30B Reasoner, 7B Implementer
         
     async def generate(self, 
                        prompt: str, 
@@ -33,20 +109,31 @@ class KruschEngine:
         
         # --- FAST-PATH NLP ROUTING ---
         if not is_code_exec and not is_tool_call:
+            # --- RAG CONTEXT RETRIEVAL FOR STANDARD NLP ---
+            rag_query = ""
+            keywords = ["docker", "postgres", "ollama", "systemd", "gpu", "nvidia", "amd", "port", "network", "dbos", "jean", "sre", "agent", "proxy", "vulkan", "error", "fail", "memory"]
+            found_keywords = [kw for kw in keywords if kw in prompt.lower()]
+            if found_keywords:
+                rag_query = found_keywords[0]
+
+            retrieved_context = retrieve_homelab_context(rag_query, project="krusch-agentic-proxy")
+            context_str = f"RETRIEVED HOMELAB CONTEXT:\n{retrieved_context}\n\n" if retrieved_context else ""
+
             ai_config_standard = {
                  'provider': 'ollama',
-                 'api_url': self.base_url,
+                 'api_url': get_ollama_url_for_model(model, self.base_url),
                  'model': model,
                  'temperature': temperature,
                  'max_tokens': max_tokens
             }
-            system_prompt = "You are a highly capable AI assistant. Answer the user's question clearly and accurately. If doing math, show your work step-by-step."
+            system_prompt = "You are a highly capable AI assistant. Answer the user's question clearly and accurately using any provided homelab context if relevant. If doing math, show your work step-by-step."
             
             try:
                 # Fast-Path Direct Pass-through
                 # Removed the slow Auditor loop based on 2026-04 benchmark findings.
                 # The Krusch Gateway now acts as a lightning-fast pass-through for standard NLP/Math.
-                final_response = await chat(system_prompt, prompt, ai_config_standard)
+                final_prompt = f"{context_str}ORIGINAL QUESTION:\n{prompt}"
+                final_response = await chat(system_prompt, final_prompt, ai_config_standard)
                 return "FAST_PATH_DIRECT", final_response
             except Exception as e:
                 raise RuntimeError(f"Standard Generation failed: {e}")
@@ -96,11 +183,21 @@ DO NOT write the final implementation logic yourself. You are strictly responsib
             final_question_part = "Question:" + parts[-1]
             thinker_prompt = f"[Context: The user provided formatting examples earlier, but they have been omitted here to prevent you from mimicking their raw text syntax. Your ONLY task is to solve the final question below and output a <holodata> JSON blueprint.]\n\n{final_question_part}"
 
-        thinker_msg = f"ORIGINAL PROBLEM:\n{thinker_prompt}\n\n{thinker_enforcement}\n\n{holodata_enforcement}\n\nCRITICAL: You MUST output ONLY a valid JSON object wrapped in <holodata> matching the requested schema. Do not output markdown explanations or math formulas outside of the JSON. NOTE: Do not leak your own <holodata> formatting instructions into the 'strict_problem_constraints'. The Implementer uses a different output format."
+        # --- RAG CONTEXT RETRIEVAL ---
+        rag_query = ""
+        keywords = ["docker", "postgres", "ollama", "systemd", "gpu", "nvidia", "amd", "port", "network", "dbos", "jean", "sre", "agent", "proxy", "vulkan", "error", "fail", "memory"]
+        found_keywords = [kw for kw in keywords if kw in prompt.lower()]
+        if found_keywords:
+            rag_query = found_keywords[0]
+        
+        retrieved_context = retrieve_homelab_context(rag_query, project="krusch-agentic-proxy")
+        context_str = f"RETRIEVED HOMELAB CONTEXT:\n{retrieved_context}\n\n" if retrieved_context else ""
+
+        thinker_msg = f"{context_str}ORIGINAL PROBLEM:\n{thinker_prompt}\n\n{thinker_enforcement}\n\n{holodata_enforcement}\n\nCRITICAL: You MUST output ONLY a valid JSON object wrapped in <holodata> matching the requested schema. Do not output markdown explanations or math formulas outside of the JSON. NOTE: Do not leak your own <holodata> formatting instructions into the 'strict_problem_constraints'. The Implementer uses a different output format."
         
         ai_config_thinker = {
              'provider': 'ollama',
-             'api_url': self.base_url,
+             'api_url': get_ollama_url_for_model(model, self.base_url),
              'model': model,
              'temperature': 0.1,
              'max_tokens': 1500
@@ -129,13 +226,13 @@ Your task is to solve the user's problem by FIRST outputting a strict "Cognitive
 
 CRITICAL: You MUST FIRST output the <holodata> block, and THEN output your final answer directly after the </holodata> closing tag. DO NOT wait for the user to reply."""
             
-            unified_msg = f"ORIGINAL PROBLEM:\n{thinker_prompt}\n\n{thinker_enforcement}"
+            unified_msg = f"{context_str}ORIGINAL PROBLEM:\n{thinker_prompt}\n\n{thinker_enforcement}"
             ai_config_unified = {
-                 'provider': 'ollama',
-                 'api_url': self.base_url,
-                 'model': model,
-                 'temperature': temperature,
-                 'max_tokens': max_tokens + 1500 # space for both blueprint and answer
+                'provider': 'ollama',
+                'api_url': get_ollama_url_for_model(model, self.base_url),
+                'model': model,
+                'temperature': temperature,
+                'max_tokens': max_tokens + 1500 # space for both blueprint and answer
             }
             
             try:
@@ -185,8 +282,8 @@ DO NOT regurgitate the blueprint back to the user. Produce exactly what the orig
             
             ai_config_implementer = {
                  'provider': 'ollama',
-                 'api_url': self.base_url,
-                 'model': model,
+                 'api_url': 'http://10.0.0.85:11434/v1/chat/completions',
+                 'model': 'qwen2.5-coder:7b',
                  'temperature': temperature,
                  'max_tokens': max_tokens
             }

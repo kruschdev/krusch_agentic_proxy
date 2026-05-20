@@ -16,9 +16,9 @@ NODE_CONFIGS = {
         "url": "http://127.0.0.1:11434/v1/chat/completions",
         "models": ["qwen2.5-coder:0.5b", "llama3.2:1b"]
     },
-    "AMD_VULKAN": {
-        "url": "http://127.0.0.1:11435/v1/chat/completions",
-        "models": ["qwen2.5-coder:3b", "llama3.2:3b"]
+    "RTX_2080_Ti": {
+        "url": "http://10.0.0.85:11437/v1/chat/completions",
+        "models": ["qwen2.5-coder:7b"]
     }
 }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # stop_proxies.sh
-# Gracefully stops both NVIDIA and AMD proxy instances using saved PID files.
+# Gracefully stops the NVIDIA proxy instance using saved PID files.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PID_DIR="$SCRIPT_DIR/.pids"
@@ -36,6 +36,5 @@ stop_proxy() {
 }
 
 stop_proxy "nvidia"
-stop_proxy "amd"
 
-echo "[*] All proxies stopped."
+echo "[*] NVIDIA proxy stopped."
