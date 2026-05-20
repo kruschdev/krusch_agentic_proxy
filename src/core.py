@@ -89,7 +89,7 @@ class KruschEngine:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         llm_conf = self.config.get('llm', {})
-        self.default_model = llm_conf.get('model', 'qwen2.5-coder:7b')
+        self.default_model = llm_conf.get('model', 'qwen3.5:9b')
         self.base_url = llm_conf.get('api_url', 'http://127.0.0.1:11434/v1/chat/completions')
         self.unified_execution = False # Split cognitive load: 30B Reasoner, 7B Implementer
         
@@ -283,7 +283,7 @@ DO NOT regurgitate the blueprint back to the user. Produce exactly what the orig
             ai_config_implementer = {
                  'provider': 'ollama',
                  'api_url': 'http://10.0.0.85:11434/v1/chat/completions',
-                 'model': 'qwen2.5-coder:7b',
+                 'model': 'qwen3.5:9b',
                  'temperature': temperature,
                  'max_tokens': max_tokens
             }

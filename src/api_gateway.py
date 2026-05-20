@@ -13,6 +13,7 @@ import time
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+import httpx
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -186,11 +187,30 @@ async def chat_completions(request: Request):
     # --- TOOL-CALLING MODE ---
     if provided_tools or is_passive_mode:
         logger.info("[Gateway] Tool-calling Mode Active. Using Dual-Engine pipeline.")
-        chat_history = (
-            f"OBJECTIVE: {user_prompt}\nAVAILABLE TOOLS:\n{json.dumps(provided_tools, indent=2)}\n"
-            if provided_tools
-            else f"OBJECTIVE: {user_prompt}\n"
-        )
+        
+        # Reconstruct the chronological conversation history to preserve memory of prior tool calls
+        chat_history = ""
+        for msg in messages:
+            role = msg.get("role", "user").upper()
+            content = msg.get("content")
+            tool_calls_data = msg.get("tool_calls")
+            
+            if role == "USER" and content:
+                chat_history += f"USER: {content}\n"
+            elif role == "ASSISTANT":
+                if content:
+                    chat_history += f"ASSISTANT: {content}\n"
+                if tool_calls_data:
+                    for tc in tool_calls_data:
+                        fn = tc.get("function", {})
+                        chat_history += f"ASSISTANT CALLED TOOL: {fn.get('name')}\nWITH ARGS: {fn.get('arguments')}\n"
+            elif role == "TOOL":
+                chat_history += f"TOOL RESULT ({msg.get('name', 'unknown')}): {content}\n"
+        
+        if provided_tools:
+            chat_history += f"\nAVAILABLE TOOLS:\n{json.dumps(provided_tools, indent=2)}\n"
+        elif not chat_history:
+            chat_history = f"OBJECTIVE: {user_prompt}\n"
 
         blueprint, response_text = await _engine.generate(
             prompt=chat_history,
@@ -293,6 +313,76 @@ async def chat_completions(request: Request):
         final_answer = f"Error: Autonomous agent timed out after {AGENT_TIMEOUT}s."
 
     return JSONResponse(_build_response(model, final_answer))
+
+
+@app.get("/api/tags")
+async def api_tags():
+    """Forward tags request to healthy local GPU-enabled Ollama endpoint."""
+    async with httpx.AsyncClient() as client:
+        try:
+            target_url = _config.get("llm", {}).get("api_url", "http://127.0.0.1:11435/v1/chat/completions")
+            host_part = target_url.split("/v1/")[0]
+            resp = await client.get(f"{host_part}/api/tags")
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except Exception as e:
+            return JSONResponse(content={"error": f"Failed to forward to Ollama: {str(e)}"}, status_code=502)
+
+
+@app.get("/v1/models")
+async def v1_models():
+    """Forward models request to healthy local GPU-enabled Ollama endpoint."""
+    async with httpx.AsyncClient() as client:
+        try:
+            target_url = _config.get("llm", {}).get("api_url", "http://127.0.0.1:11435/v1/chat/completions")
+            host_part = target_url.split("/v1/")[0]
+            resp = await client.get(f"{host_part}/v1/models")
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except Exception as e:
+            return JSONResponse(content={"error": f"Failed to forward to Ollama: {str(e)}"}, status_code=502)
+
+
+@app.post("/api/embeddings")
+async def api_embeddings(request: Request):
+    """Forward embeddings request to healthy local GPU-enabled Ollama endpoint."""
+    body = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            target_url = _config.get("llm", {}).get("api_url", "http://127.0.0.1:11435/v1/chat/completions")
+            host_part = target_url.split("/v1/")[0]
+            resp = await client.post(f"{host_part}/api/embeddings", json=body, timeout=60.0)
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except Exception as e:
+            return JSONResponse(content={"error": f"Failed to forward to Ollama: {str(e)}"}, status_code=502)
+
+
+@app.post("/v1/embeddings")
+async def v1_embeddings(request: Request):
+    """Forward v1/embeddings request to healthy local GPU-enabled Ollama endpoint."""
+    body = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            target_url = _config.get("llm", {}).get("api_url", "http://127.0.0.1:11435/v1/chat/completions")
+            host_part = target_url.split("/v1/")[0]
+            resp = await client.post(f"{host_part}/v1/embeddings", json=body, timeout=60.0)
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except Exception as e:
+            return JSONResponse(content={"error": f"Failed to forward to Ollama: {str(e)}"}, status_code=502)
+
+
+@app.post("/api/generate")
+async def api_generate(request: Request):
+    """Forward generate request to healthy local GPU-enabled Ollama endpoint."""
+    body = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            target_url = _config.get("llm", {}).get("api_url", "http://127.0.0.1:11435/v1/chat/completions")
+            host_part = target_url.split("/v1/")[0]
+            resp = await client.post(f"{host_part}/api/generate", json=body, timeout=120.0)
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except Exception as e:
+            return JSONResponse(content={"error": f"Failed to forward to Ollama: {str(e)}"}, status_code=502)
+
+
 
 
 if __name__ == "__main__":
