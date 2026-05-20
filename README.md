@@ -5,8 +5,9 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
 ![FastMCP](https://img.shields.io/badge/FastMCP-005571?style=flat)
+![Version: 0.3.0](https://img.shields.io/badge/Version-0.3.0-green.svg)
 
-**Krusch Agentic MCP** is a standalone Model Context Protocol (MCP) server that transforms small-parameter, local-first LLMs (like `Qwen2.5-Coder-7B`) into highly reliable, structured execution nodes for autonomous agents.
+**Krusch Agentic MCP (v0.3.0)** is a standalone Model Context Protocol (MCP) server that transforms small-parameter, local-first LLMs (like `Qwen2.5-Coder-7B`) into highly reliable, structured execution nodes for autonomous agents. Now equipped with dynamic PostgreSQL relational database RAG memory injection and model-aware hardware routing.
 
 If you are running agent frameworks like **OpenClaw**, **Hermes**, or using IDEs like **Cursor**, you know the struggle: 7B models frequently hallucinate JSON tools, forget code architectures, or break under complex constraints. 
 
@@ -17,15 +18,23 @@ Krusch Agentic MCP solves this by exposing a single MCP Tool (`krusch_execute_ta
 1. **Zero-Hallucination Tool Calling**: By forcing models to output a rigid `<holodata>` cognitive blueprint *before* writing JSON or code, syntax errors and hallucinated tool arguments drop to near zero, unlocking reliable agentic behavior on sub-10B parameter models.
 2. **Unified API Gateway**: Acts as an OpenAI-compatible proxy (`localhost:5440`) and an MCP server (`stdio`) simultaneously, allowing any legacy or modern client (OpenClaw, Cursor, Chatbots) to benefit from the dual-engine pipeline.
 3. **Optimized Latency**: Uses **Unified Execution** mode to autoregressively stream the blueprint and the final implementation in a single pass, cutting cognitive latency in half.
-4. **Standalone Architecture**: 100% decoupled from specific business logic or homelab dependencies, designed explicitly as a generalized execution node for the open-source community.
+4. **Standalone Architecture**: 100% decoupled from specific business logic or local-network dependencies, designed explicitly as a generalized execution node for the open-source community.
 
 ### 🌊 Multi-Provider Waterfall Auto-Routing (v0.2.0+)
 
-Krusch Agentic MCP now features a resilient **Waterfall Auto-Routing** proxy. You can configure multiple LLM providers to ensure task continuity if your primary model fails.
+Krusch Agentic MCP features a resilient **Waterfall Auto-Routing** proxy. You can configure multiple LLM providers to ensure task continuity if your primary model fails.
 
 - **Primary Local/VPS Models:** Route tasks to a private VPS-hosted model (like Nous Hermes) via secure API keys.
 - **Cost-Effective Fallbacks:** If the primary node is unreachable or encounters an error, the proxy automatically falls back to secondary routes like OpenRouter (e.g. Gemini Flash, Llama 3).
 - **Environment Variable Secrets:** Safely pass API keys via `ENV:MY_API_KEY` configurations instead of hardcoding them.
+
+### 🧠 Episodic RAG & Hardware-Aware Swarm Routing (v0.3.0+)
+
+Version 0.3.0 integrates the proxy directly with active relational/episodic memory stores and automates cross-node LLM hardware routing:
+
+- **Direct PostgreSQL RAG Memory Hook:** Intercepts prompt keywords (like `gpu`, `systemd`, `postgres`) and dynamically retrieves active episodic lessons and contextual nuggets from a PostgreSQL memory database. This injected context is automatically fed to the model, eliminating baseline hallucinations of host system architectures.
+- **Dynamic Node-Aware Fleet Routing:** Automatically routes heavy MoE or reasoning models (like `Qwen3-Coder-30B` or `DeepSeek-R1-14B`) to high-capacity compute nodes (e.g. dual-GPU setups) and offloads smaller execution/ideation models (like `qwen2.5-coder:7b`) to lighter GPU instances in your network, optimizing VRAM and PCIe bandwidth across the cluster.
+
 
 ### 🔄 Dual Integration Modes (MCP vs API Proxy)
 
